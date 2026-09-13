@@ -61,7 +61,8 @@ jobs:
           }
 
           # Install WDK VSIX for MSBuild integration into the selected VS2022 instance.
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
           if (-not (Test-Path $vswhere)) {
             Write-Error "vswhere.exe not found"
             exit 1
@@ -101,9 +102,95 @@ jobs:
           }
           Write-Host "Verified WDK MSBuild task: $($wdkTask.FullName)"
 
+      - name: Verify ARM64 toolchain and SDK
+        # ARM64 driver builds need (a) the Windows 11 SDK that matches the WDK
+        # we just installed (10.0.22621) and (b) the MSVC v143 ARM64 target
+        # platform toolset from Visual Studio Build Tools. The windows-2022
+        # GitHub-hosted runner ships with an older Windows 10 SDK and only
+        # the x64/x86 MSVC components, both of which the WDK installer leaves
+        # untouched. Without these, MSBuild fails with MSB8020 (no ARM64
+        # build tools) or LNK2019 (unresolved IddCx / WDF symbols) on the
+        # ARM64 matrix entry. x64 builds skip this step.
+        if: matrix.platform == 'ARM64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # ProgramFiles(x86) has parens and isn't a legal variable name, so
+          # resolve it once through .NET instead of $env:ProgramFiles(x86).
+          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+
+          function Get-VisualStudioInstallPath {
+            $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (-not (Test-Path $vswhere)) { return $null }
+            & $vswhere -products * -requires Microsoft.Component.MSBuild -version '[17.0,18.0)' -property installationPath -latest
+          }
+
+          $vsInstall = Get-VisualStudioInstallPath
+          if (-not $vsInstall) {
+            Write-Error "Visual Studio 2022 with MSBuild was not found. ARM64 build requires it."
+            exit 1
+          }
+          Write-Host "Visual Studio install: $vsInstall"
+
+          $vsInstallerExe = Join-Path $pf86 'Microsoft Visual Studio\Installer\vs_installer.exe'
+          if (-not (Test-Path $vsInstallerExe)) {
+            Write-Error "vs_installer.exe not found at $vsInstallerExe — cannot add components to Visual Studio."
+            exit 1
+          }
+
+          # Add the ARM64 MSVC component. This is idempotent — when the
+          # component is already present, vs_installer prints a "modify not
+          # required" message and exits 0.
+          Write-Host "Ensuring VC.Tools.ARM64 component is installed..."
+          $vcArm64 = & $vsInstallerExe modify --installPath $vsInstall --quiet --norestart --noUpdate --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 2>&1
+          Write-Host "vs_installer modify output: $vcArm64"
+
+          # Confirm the ARM64 MSVC cl.exe and link.exe are now on disk.
+          $arm64Cl = Get-ChildItem (Join-Path $vsInstall 'VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe') -ErrorAction SilentlyContinue | Select-Object -First 1
+          $arm64Link = Get-ChildItem (Join-Path $vsInstall 'VC\Tools\MSVC\*\bin\Hostx64\arm64\link.exe') -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $arm64Cl -or -not $arm64Link) {
+            Write-Error "ARM64 MSVC toolset not found under $vsInstall\VC\Tools\MSVC\*\bin\Hostx64\arm64\"
+            Write-Error "As a fallback, set up a self-hosted runner with Visual Studio 2022 + the 'Desktop development with C++' workload + ARM64 component."
+            exit 1
+          }
+          Write-Host "ARM64 cl.exe:  $($arm64Cl.FullName)"
+          Write-Host "ARM64 link.exe: $($arm64Link.FullName)"
+
+          # Confirm the WDK ARM64 IddCx / WDF libs are present (these come
+          # with the WDK installer, not Visual Studio).
+          $wdkLib = Get-ChildItem 'C:\Program Files*\Windows Kits\10\Lib\*\um\arm64\iddcx.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+          $wdkInc = Get-ChildItem 'C:\Program Files*\Windows Kits\10\Include\*\um\iddcx.h' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $wdkLib) {
+            Write-Error "WDK ARM64 iddcx.lib not found under C:\Program Files*\Windows Kits\10\Lib\*\um\arm64\ — the WDK installer did not lay down the ARM64 libraries."
+            exit 1
+          }
+          if (-not $wdkInc) {
+            Write-Error "WDK iddcx.h not found under C:\Program Files*\Windows Kits\10\Include\*\um\ — the WDK installer did not lay down the headers."
+            exit 1
+          }
+          Write-Host "WDK ARM64 iddcx.lib: $($wdkLib.FullName)"
+          Write-Host "WDK iddcx.h:         $($wdkInc.FullName)"
+
+          # Confirm a Windows SDK that matches the WDK is on the include path.
+          $sdk22621 = Get-ChildItem 'C:\Program Files*\Windows Kits\10\Lib\10.0.22621.0\um\arm64\kernel32.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sdk22621) {
+            Write-Warning "Windows SDK 10.0.22621.0 not found — the WDK was built against this SDK. Falling back to whatever SDK the WDK installer left behind, which may cause LNK2019 / LNK1120 on ARM64."
+            Get-ChildItem 'C:\Program Files*\Windows Kits\10\Lib' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  Available SDK: $($_.Name)" }
+          } else {
+            Write-Host "Windows SDK 10.0.22621.0 ARM64 kernel32.lib: $($sdk22621.FullName)"
+          }
+
       - name: Build the driver
         run: |
-          msbuild "ZakoVDD.sln" /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }}
+          # /v:detailed surfaces which arm64 .lib / .h path is missing in the
+          # log, in case the build still fails. /clp:NoSummary keeps CI logs
+          # readable when x64 succeeds.
+          msbuild "ZakoVDD.sln" `
+            /p:Configuration=${{ matrix.configuration }} `
+            /p:Platform=${{ matrix.platform }} `
+            /v:${{ matrix.platform == 'ARM64' && 'detailed' || 'minimal' }} `
+            /clp:${{ matrix.platform == 'ARM64' && 'NoSummary;ForceConsoleColor' || 'NoSummary' }}
 
       - name: Build Vulkan HDR diagnostics
         shell: cmd
@@ -174,8 +261,18 @@ jobs:
           }
           Write-Host "Using stampinf -a $archToken"
 
+          # Print the [Manufacturer] line BEFORE stamping so the log captures
+          # whether MSBuild's infgen pass left $ARCH$ as a literal placeholder
+          # or expanded it to the platform-specific section name. This is the
+          # most common silent-corruption vector on ARM64 builds.
+          Get-Content $infPath | Select-String -Pattern 'Manufacturer|ARCH' | ForEach-Object { Write-Host "  INF pre : $_" }
+
           & $stampinf.FullName -f $infPath -d $date -v $version -a $archToken
-          if ($LASTEXITCODE -ne 0) { Write-Error "stampinf failed: $LASTEXITCODE"; exit 1 }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "stampinf failed with exit $LASTEXITCODE — printing the post-stampinf INF for diagnosis"
+            Get-Content $infPath | ForEach-Object { Write-Host "  INF post: $_" }
+            exit 1
+          }
           Get-Content $infPath | Select-String "DriverVer"
 
           # Rebuild the catalog immediately. stampinf just changed DriverVer,
