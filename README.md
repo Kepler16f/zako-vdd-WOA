@@ -266,6 +266,47 @@ Virtual-Display-Driver/
    - 检查是否以管理员权限运行
    - 确认系统版本符合要求（Windows 10 22H2+）
 
+2. **安装时提示「文件的哈希值不在指定的目录中」/「File hash not in specified catalog」**
+   这是 catalog 签名校验失败，最常见于从 PR / commit 直接下载的 CI 产物。
+   - 打开 `zakovdd-arm64.zip`（或 `zakovdd-x64.zip`），**确认里面有 `ZakoVDD.cer`**
+     - 如果**没有** `.cer`，说明你下载的产物构建失败，重新触发一次 GitHub Actions build 即可
+     - 如果**有** `.cer`，先**导入它**再装驱动（见下方「手动安装证书」）
+   - 打开**管理员** PowerShell，依次执行：
+     ```powershell
+     # 让 Windows 接受测试签名（重启后生效）
+     bcdedit /set testsigning on
+     # 导入驱动证书到受信任的根证书颁发机构
+     Import-Certificate -FilePath .\ZakoVDD.cer -CertStoreLocation Cert:\LocalMachine\Root
+     # 导入到受信任的发布者（驱动安装器会用这个 store 校验）
+     Import-Certificate -FilePath .\ZakoVDD.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+     ```
+   - **重启** 后再安装驱动（`testsigning on` 必须在下次启动时生效）
+   - 如果仍然报这个错，**不要继续重试**——把 GitHub Actions 的 build log 抓出来看，重点看 `Stamp driver version and rebuild catalog` 和 `Sign driver with certificate` 两个 step 是否都成功
+
+3. **PR / commit 产物的安全性提示**
+   - 本仓库 CI 在没有 `SIGNING_CERT_PFX` secret 时会**回退到每次构建生成一个自签测试证书**（CN=`ZakoVDD Test Signing (CI)`）。这种产物**仅供开发测试**，不能用于公开发布
+   - 正式 release（带 git tag 的 build）应配置仓库 secret `SIGNING_CERT_PFX` 与 `SIGNING_CERT_PASSWORD`，CI 会用真实代码签名证书代替自签证书
+   - **每次 PR / commit build 的证书都不一样**，所以**重装前先删掉旧的 `ZakoVDD.cer`**，否则旧证书会覆盖新证书导致新 .cat 校验失败
+
+### 手动安装证书
+
+如果包内没有 `ZakoVDD.cer`（或你想用自己签的证书），可以手动生成：
+
+```powershell
+# 在管理员 PowerShell 中：
+$cert = New-SelfSignedCertificate `
+  -Subject "CN=ZakoVDD Test" `
+  -Type CodeSigningCert `
+  -CertStoreLocation "Cert:\LocalMachine\Root" `
+  -KeyUsage DigitalSignature `
+  -KeyAlgorithm RSA -KeyLength 2048 `
+  -NotAfter (Get-Date).AddDays(365)
+
+Export-Certificate -Cert $cert -FilePath .\ZakoVDD.cer
+```
+
+然后再按上一节的步骤把它导入到 `Root` 和 `TrustedPublisher` 两个 store。
+
 2. **虚拟显示器不显示**
    - 检查设备管理器中驱动是否正常加载
    - 查看 Windows 显示设置

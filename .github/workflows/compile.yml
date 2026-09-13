@@ -115,22 +115,26 @@ jobs:
           call tools\desktop_hdr_capture\build_consumer.bat || exit /b 1
           call tools\vdd_capture_test\build_consumer.bat || exit /b 1
 
-      - name: Stamp driver version
+      - name: Stamp driver version and rebuild catalog
         shell: pwsh
         run: |
-          # Resolve stampinf path from WDK. The stampinf tool is an x64 host
-          # binary that handles both x64 and ARM64 INF $ARCH$ expansion, so we
-          # always pick the x64 build regardless of the matrix platform.
+          $ErrorActionPreference = 'Stop'
+
+          # Resolve WDK host tools (x64 build of stampinf/inf2cat, host is x64
+          # regardless of the driver platform being built).
           $stampinf = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin\*\x64\stampinf.exe" -ErrorAction SilentlyContinue |
                       Sort-Object { $_.Directory.Parent.Name } -Descending |
                       Select-Object -First 1
-          if (-not $stampinf) {
-            Write-Error "stampinf.exe not found"
-            exit 1
-          }
+          $inf2cat  = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin\*\x64\inf2cat.exe","C:\Program Files*\Windows Kits\10\bin\*\x86\inf2cat.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object { $_.Directory.Parent.Name } -Descending |
+                      Select-Object -First 1
+          if (-not $stampinf) { Write-Error "stampinf.exe not found"; exit 1 }
+          if (-not $inf2cat)  { Write-Error "inf2cat.exe not found";  exit 1 }
           Write-Host "Using stampinf: $($stampinf.FullName)"
+          Write-Host "Using inf2cat:  $($inf2cat.FullName)"
 
-          $infPath = "${{ matrix.platform }}\${{ matrix.configuration }}\ZakoVDD\ZakoVDD.inf"
+          $buildDir = "${{ matrix.platform }}\${{ matrix.configuration }}\ZakoVDD"
+          $infPath  = Join-Path $buildDir "ZakoVDD.inf"
 
           # Extract numeric version from tag (e.g. v0.13 -> 100.0.13.0,
           # v0.15.3-zak2333 -> 100.0.15.3) or use date-based version.
@@ -161,87 +165,121 @@ jobs:
           $date = Get-Date -Format "MM/dd/yyyy"
           Write-Host "Setting DriverVer = $date, $version"
 
-          & $stampinf.FullName -f $infPath -d $date -v $version
+          # Map the matrix platform to the stampinf -a token. Without -a,
+          # stampinf defaults to x86, which would corrupt the [Manufacturer]
+          # section on an ARM64 build and silently mis-stamp on an x64 build.
+          $archToken = switch -Wildcard ("${{ matrix.platform }}") {
+            "ARM64" { "arm64" }
+            default { "amd64" }
+          }
+          Write-Host "Using stampinf -a $archToken"
+
+          & $stampinf.FullName -f $infPath -d $date -v $version -a $archToken
+          if ($LASTEXITCODE -ne 0) { Write-Error "stampinf failed: $LASTEXITCODE"; exit 1 }
           Get-Content $infPath | Select-String "DriverVer"
+
+          # Rebuild the catalog immediately. stampinf just changed DriverVer,
+          # so the MSBuild-generated .cat from the prior step is now stale and
+          # would fail catalog verification with "file hash not in the specified
+          # catalog file" on install. We always run inf2cat here so the .cat
+          # is in lockstep with the INF before any signing step touches it.
+          $osList = "10_X64,10_ARM64"
+          Write-Host "Rebuilding catalog: $($inf2cat.FullName) /driver:$buildDir /os:$osList"
+          & $inf2cat.FullName /driver:"$buildDir" /os:$osList /verbose
+          if ($LASTEXITCODE -ne 0) { Write-Error "inf2cat failed: $LASTEXITCODE"; exit 1 }
+
+          # Verify that the freshly built .cat actually hashes to something the
+          # INF will resolve to; a missing .cat after inf2cat is the classic
+          # cause of the install-time "hash not in catalog" error.
+          $catFile = Join-Path $buildDir "zakovdd.cat"
+          if (-not (Test-Path $catFile)) {
+            Write-Error "Expected catalog file not found: $catFile"
+            exit 1
+          }
+          Write-Host "Rebuilt catalog: $catFile ($((Get-Item $catFile).Length) bytes)"
 
       - name: List build directory
         continue-on-error: true
         run: dir "${{ matrix.platform }}\${{ matrix.configuration }}\ZakoVDD"
 
       - name: Sign driver with certificate
-        # PR builds do not receive signing secrets. Tag/main builds sign when the
-        # repository has a certificate configured.
+        # Catalog signing is always required — without it, the freshly rebuilt
+        # .cat from the previous step is unsigned and Windows refuses to install
+        # the driver with "file hash not in the specified catalog file". When
+        # SIGNING_CERT_PFX is configured we use the release certificate;
+        # otherwise we fall back to a per-build self-signed test certificate so
+        # PR / development builds still install cleanly with the same .cer.
         shell: pwsh
         env:
           SIGNING_CERT_PFX: ${{ secrets.SIGNING_CERT_PFX }}
           SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
         run: |
-          if (-not $env:SIGNING_CERT_PFX) {
-            Write-Host "::warning::No signing certificate configured, skipping signing"
-            exit 0
-          }
+          $ErrorActionPreference = 'Stop'
 
-          # Import PFX certificate and get its thumbprint
-          $pfxBytes = [Convert]::FromBase64String($env:SIGNING_CERT_PFX)
-          $pfxPath = Join-Path $env:TEMP "signcert.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-
-          $securePass = ConvertTo-SecureString $env:SIGNING_CERT_PASSWORD -AsPlainText -Force
-          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass
-          $thumbprint = $cert.Thumbprint
-          Write-Host "Imported certificate thumbprint: $thumbprint"
-          Remove-Item $pfxPath -Force
-
-          # Locate signtool from WDK. signtool runs on the build host (x64), so we
-          # always pick the x64 build here regardless of the driver platform being
-          # signed.
+          # Locate signtool from WDK. signtool is an x64 host binary, so we
+          # always pick the x64 build regardless of the driver platform.
           $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
                       Sort-Object { $_.Directory.Parent.Name } -Descending |
                       Select-Object -First 1
-          if (-not $signtool) {
-            Write-Error "signtool.exe not found"
-            exit 1
-          }
+          if (-not $signtool) { Write-Error "signtool.exe not found"; exit 1 }
           Write-Host "Using signtool: $($signtool.FullName)"
 
           $buildDir = "${{ matrix.platform }}\${{ matrix.configuration }}\ZakoVDD"
-          
-          # Search for inf2cat in both x64 and x86 (MSBuild uses x86)
-          $inf2cat = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin\*\x64\inf2cat.exe","C:\Program Files*\Windows Kits\10\bin\*\x86\inf2cat.exe" -ErrorAction SilentlyContinue |
-                     Sort-Object { $_.Directory.Parent.Name } -Descending |
-                     Select-Object -First 1
-
-          # Recreate catalog file after stampinf modified the INF. Always stamp
-          # both x64 and ARM64 OS targets into the catalog so a single .cat
-          # installs cleanly on either architecture, regardless of which matrix
-          # entry produced it.
-          $osList = "10_X64,10_ARM64"
-          if ($inf2cat) {
-            Write-Host "Recreating catalog with inf2cat: $($inf2cat.FullName) /os:$osList"
-            & $inf2cat.FullName /driver:"$buildDir" /os:$osList /verbose
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "inf2cat failed with exit code $LASTEXITCODE"
-              exit 1
-            }
-            Write-Host "Catalog regenerated successfully"
-          } else {
-            Write-Error "inf2cat.exe not found"
+          $catFile  = Join-Path $buildDir "zakovdd.cat"
+          if (-not (Test-Path $catFile)) {
+            Write-Error "Catalog $catFile is missing — the previous stampinf + inf2cat step should have created it"
             exit 1
           }
 
-          # Sign the catalog file with our specific certificate
-          $catFile = Join-Path $buildDir "zakovdd.cat"
-          if (Test-Path $catFile) {
-            Write-Host "Signing catalog file..."
-            & $signtool.FullName sign /sha1 $thumbprint /fd SHA256 /v $catFile
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to sign catalog file"
-              exit 1
-            }
-            Write-Host "Catalog signed successfully"
+          # Resolve which certificate to use.
+          if ($env:SIGNING_CERT_PFX) {
+            $pfxBytes = [Convert]::FromBase64String($env:SIGNING_CERT_PFX)
+            $pfxPath  = Join-Path $env:TEMP "signcert.pfx"
+            [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+            $securePass = ConvertTo-SecureString $env:SIGNING_CERT_PASSWORD -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass
+            Remove-Item $pfxPath -Force
+            Write-Host "Using PFX signing certificate, thumbprint $($cert.Thumbprint)"
+          } else {
+            Write-Host "::warning::No SIGNING_CERT_PFX configured — generating a per-build self-signed test certificate. Only use this build for development; production releases should configure a real code-signing certificate."
+            $cert = New-SelfSignedCertificate `
+              -Subject "CN=ZakoVDD Test Signing (CI), O=Kepler16f" `
+              -Type CodeSigningCert `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -KeyUsage DigitalSignature `
+              -KeyAlgorithm RSA `
+              -KeyLength 2048 `
+              -NotAfter (Get-Date).AddDays(365) `
+              -KeyExportPolicy Exportable `
+              -KeyProtection None
           }
 
-          # Export the signing certificate as .cer (overrides the self-signed test cert from MSBuild)
+          # Sign the .cat. /tr adds an RFC3161 timestamp that Windows 11 22H2+
+          # requires for the modern driver signing model (especially on ARM64);
+          # /td SHA256 keeps the timestamp digest consistent with the main
+          # /fd SHA256 signature.
+          $timestampServer = "http://timestamp.digicert.com"
+          Write-Host "Signing $catFile with timestamp $timestampServer"
+          & $signtool.FullName sign /sha1 $cert.Thumbprint /fd SHA256 /tr $timestampServer /td SHA256 /v $catFile
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "signtool sign failed: $LASTEXITCODE"
+            exit 1
+          }
+
+          # Verify the signature came back clean so we don't ship a half-signed
+          # .cat (the next install attempt would still fail with the same
+          # "hash not in catalog" error, but in a much more confusing way).
+          Write-Host "Verifying catalog signature..."
+          & $signtool.FullName verify /pa /v $catFile
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "signtool verify failed: $LASTEXITCODE"
+            exit 1
+          }
+
+          # Export the .cer users must install into "Trusted Root Certification
+          # Authorities" and "Trusted Publishers" before they can install the
+          # driver. With a PFX we export the release cert; with a self-signed
+          # fallback we export the per-build cert so users get a matching pair.
           $cerPath = Join-Path (Split-Path $buildDir -Parent) "ZakoVDD.cer"
           Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
           Write-Host "Exported signing certificate to $cerPath"
