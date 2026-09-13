@@ -15,9 +15,11 @@
 
 ## 📋 系统要求
 
-- **操作系统**: Windows 10 22H2 或更高版本
-- **架构**: x64
-- **GPU**: 支持 DirectX 11 的显卡
+- **操作系统**: 
+  - x64: Windows 10 22H2 或更高版本
+  - **ARM64 (Windows on ARM)**: Windows 11 22H2 或更高版本（IDDCX 1.10 在 WOA 上要求 Win11）
+- **架构**: x64 或 ARM64 (Snapdragon X、Surface Pro X 等)
+- **GPU**: 支持 DirectX 11 的显卡（ARM64 设备上即 Qualcomm Adreno 集成显卡）
 - **权限**: 管理员权限（用于安装驱动）
 
 ## 🚀 快速开始
@@ -226,9 +228,14 @@ cd Virtual-Display-Driver
 
 2. 使用 Visual Studio 打开仓库根目录下的 `ZakoVDD.sln`
 
-3. 选择配置（Debug 或 Release）和平台（x64）
+3. 选择配置（Debug 或 Release）和平台（**x64** 或 **ARM64**）
+
+   - **x64** —— 适用于传统 Intel/AMD Windows 主机
+   - **ARM64** —— 适用于 Windows on ARM (Snapdragon X、Surface Pro X 等) 设备
 
 4. 构建解决方案
+
+> Windows on ARM 用户的额外提示：请下载发布包中的 `zakovdd-arm64.zip` 而不是 `zakovdd-x64.zip`。驱动使用同名的 `ZakoVDD.dll`，但 ARM64 包内的 .dll / .cat 才是 WoW 友好的原生 ARM64 版本。Community Scripts 脚本与 PowerShell 本身都是架构无关的，无需区分。
 
 ### 项目结构
 

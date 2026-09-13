@@ -19,7 +19,7 @@ jobs:
     strategy:
       matrix:
         configuration: [Release]
-        platform: [x64]
+        platform: [x64, ARM64]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -118,7 +118,9 @@ jobs:
       - name: Stamp driver version
         shell: pwsh
         run: |
-          # Resolve stampinf path from WDK
+          # Resolve stampinf path from WDK. The stampinf tool is an x64 host
+          # binary that handles both x64 and ARM64 INF $ARCH$ expansion, so we
+          # always pick the x64 build regardless of the matrix platform.
           $stampinf = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin\*\x64\stampinf.exe" -ErrorAction SilentlyContinue |
                       Sort-Object { $_.Directory.Parent.Name } -Descending |
                       Select-Object -First 1
@@ -190,7 +192,9 @@ jobs:
           Write-Host "Imported certificate thumbprint: $thumbprint"
           Remove-Item $pfxPath -Force
 
-          # Locate signtool from WDK
+          # Locate signtool from WDK. signtool runs on the build host (x64), so we
+          # always pick the x64 build here regardless of the driver platform being
+          # signed.
           $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
                       Sort-Object { $_.Directory.Parent.Name } -Descending |
                       Select-Object -First 1
@@ -207,10 +211,14 @@ jobs:
                      Sort-Object { $_.Directory.Parent.Name } -Descending |
                      Select-Object -First 1
 
-          # Recreate catalog file after stampinf modified the INF
+          # Recreate catalog file after stampinf modified the INF. Always stamp
+          # both x64 and ARM64 OS targets into the catalog so a single .cat
+          # installs cleanly on either architecture, regardless of which matrix
+          # entry produced it.
+          $osList = "10_X64,10_ARM64"
           if ($inf2cat) {
-            Write-Host "Recreating catalog with inf2cat: $($inf2cat.FullName)"
-            & $inf2cat.FullName /driver:"$buildDir" /os:10_X64 /verbose
+            Write-Host "Recreating catalog with inf2cat: $($inf2cat.FullName) /os:$osList"
+            & $inf2cat.FullName /driver:"$buildDir" /os:$osList /verbose
             if ($LASTEXITCODE -ne 0) {
               Write-Error "inf2cat failed with exit code $LASTEXITCODE"
               exit 1
@@ -267,10 +275,19 @@ jobs:
           name: Built-Driver-Release-x64
           path: driver-x64/
 
-      - name: Package release zip
+      - name: Download ARM64 Release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Built-Driver-Release-ARM64
+          path: driver-arm64/
+
+      - name: Package release zips (x64 and arm64)
         run: |
+          set -e
+          # Per-architecture flat zip preserves the historical layout (x64 stays
+          # at the top level). Windows on ARM users pick the arm64 zip.
           cd driver-x64
-          zip -j ../zakovdd.zip \
+          zip -j ../zakovdd-x64.zip \
             x64/Release/ZakoVDD/ZakoVDD.dll \
             x64/Release/ZakoVDD/ZakoVDD.inf \
             x64/Release/ZakoVDD/zakovdd.cat \
@@ -279,17 +296,41 @@ jobs:
             tools/vulkan_hdr_bridge/build/zako_vulkan_hdr_bridge.dll \
             tools/vulkan_hdr_bridge/build/VkLayer_zako_virtual_hdr.json \
             tools/vulkan_hdr_probe/build/vulkan_hdr_probe.exe
+          cd ../driver-arm64
+          zip -j ../zakovdd-arm64.zip \
+            ARM64/Release/ZakoVDD/ZakoVDD.dll \
+            ARM64/Release/ZakoVDD/ZakoVDD.inf \
+            ARM64/Release/ZakoVDD/zakovdd.cat \
+            ARM64/Release/ZakoVDD/vdd_settings.xml \
+            ARM64/Release/ZakoVDD.cer \
+            tools/vulkan_hdr_bridge/build/zako_vulkan_hdr_bridge.dll \
+            tools/vulkan_hdr_bridge/build/VkLayer_zako_virtual_hdr.json \
+            tools/vulkan_hdr_probe/build/vulkan_hdr_probe.exe
           cd ..
+          # Combined zip: top-level files for x64 (back-compat) plus an arm64/
+          # subfolder for Windows on ARM users.
+          cp driver-x64/x64/Release/ZakoVDD/vdd_settings.xml vdd_settings.xml
+          zip -j zakovdd.zip \
+            driver-x64/x64/Release/ZakoVDD/ZakoVDD.dll \
+            driver-x64/x64/Release/ZakoVDD/ZakoVDD.inf \
+            driver-x64/x64/Release/ZakoVDD/zakovdd.cat \
+            vdd_settings.xml \
+            driver-x64/x64/Release/ZakoVDD.cer
+          zip -r zakovdd.zip driver-arm64/ARM64/Release/ZakoVDD -x "*.cer"
+          rm vdd_settings.xml
           unzip -l zakovdd.zip
-          for required in ZakoVDD.dll ZakoVDD.inf zakovdd.cat vdd_settings.xml ZakoVDD.cer \
-                          zako_vulkan_hdr_bridge.dll VkLayer_zako_virtual_hdr.json vulkan_hdr_probe.exe; do
+          for required in ZakoVDD.dll ZakoVDD.inf zakovdd.cat vdd_settings.xml \
+                          arm64/Release/ZakoVDD/ZakoVDD.dll arm64/Release/ZakoVDD/ZakoVDD.inf; do
             unzip -l zakovdd.zip "$required" >/dev/null
           done
-          ls -la zakovdd.zip
+          ls -la zakovdd.zip zakovdd-x64.zip zakovdd-arm64.zip
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: zakovdd.zip
+          files: |
+            zakovdd.zip
+            zakovdd-x64.zip
+            zakovdd-arm64.zip
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}

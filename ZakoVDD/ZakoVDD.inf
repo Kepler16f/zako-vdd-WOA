@@ -1,5 +1,8 @@
 ; ZakoVDD.inf
 ;
+; Supports both x64 and ARM64 (Windows on ARM) hosts. MSBuild's InfGen
+; expands $ARCH$ per-platform (x64 / ARM64) at build time, so the same INF
+; installs cleanly on x64 Windows 10/11 and on Snapdragon/ARM64 Windows 11.
 
 [Version]
 PnpLockdown=1

@@ -20,6 +20,28 @@
         "_UNICODE"
       ],
       "intelliSenseMode": "windows-msvc-x64"
+    },
+    {
+      "inheritEnvironments": [
+        "msvc_arm64"
+      ],
+      "name": "ARM64-Debug",
+      "includePath": [
+        "${env.INCLUDE}",
+        "${workspaceRoot}\\**"
+      ],
+      "defines": [
+        "_WIN64",
+        "_ARM64",
+        "_DEBUG",
+        "UMDF_DRIVER",
+        "IDDCX_VERSION_MAJOR=1",
+        "IDDCX_VERSION_MINOR=10",
+        "IDDCX_MINIMUM_VERSION_REQUIRED=3",
+        "UNICODE",
+        "_UNICODE"
+      ],
+      "intelliSenseMode": "windows-msvc-arm64"
     }
   ]
 }
